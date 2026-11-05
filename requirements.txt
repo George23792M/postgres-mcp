@@ -1,0 +1,5 @@
+# Runtime dependencies for the Postgres MCP server.
+asyncpg>=0.30.0
+loguru>=0.7.3
+mcp[cli]>=1.9.0,<2
+pydantic-settings>=2.7.1
