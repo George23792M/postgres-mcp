@@ -2,9 +2,10 @@
 
 import httpx
 import pytest
+from loguru import logger
 from mcp.server.fastmcp.exceptions import ToolError
 
-from app.errors import NotFoundError
+from app.errors import DatabaseUnavailableError, InvalidInputError, NotFoundError
 from app.server import BearerAuthMiddleware, _safe_tool, create_server
 
 
@@ -63,14 +64,135 @@ async def test_server_registers_exactly_five_expected_tools(test_settings):
 
 
 @pytest.mark.asyncio
-async def test_safe_tool_exposes_expected_service_error_message():
-    """Expected service errors remain clear and client-safe."""
-    async def missing_customer():
-        """Raise the service error to exercise safe error translation."""
-        raise NotFoundError("Customer not found")
+async def test_safe_tool_preserves_successful_return_values():
+    """Successful wrapped tools return their original result unchanged."""
+    async def successful_tool():
+        """Return a deterministic result as a normal tool would."""
+        return {"status": "ok", "count": 2}
 
-    with pytest.raises(ToolError, match="Customer not found"):
+    assert await _safe_tool(successful_tool)() == {"status": "ok", "count": 2}
+
+
+@pytest.mark.asyncio
+async def test_safe_tool_formats_expected_service_error_metadata():
+    """Expected service errors render all stable fields instead of legacy prose."""
+    async def missing_customer():
+        """Raise a service error containing unsafe legacy text."""
+        raise NotFoundError("synthetic private customer details")
+
+    with pytest.raises(ToolError) as error:
         await _safe_tool(missing_customer)()
+
+    rendered = str(error.value)
+    assert rendered == (
+        "code=not_found; message=The requested resource was not found.; "
+        "hint=Verify the identifier and your access to the requested resource.; "
+        "retryable=false"
+    )
+    assert "synthetic private customer details" not in rendered
+
+
+@pytest.mark.asyncio
+async def test_safe_tool_marks_database_unavailable_retryable():
+    """A transient availability error renders its code and retryable status."""
+    async def database_unavailable():
+        """Raise the expected temporary database error."""
+        raise DatabaseUnavailableError()
+
+    with pytest.raises(ToolError) as error:
+        await _safe_tool(database_unavailable)()
+
+    assert "code=database_unavailable;" in str(error.value)
+    assert "retryable=true" in str(error.value)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("field", "payload"),
+    [
+        ("customer_id", "'; DROP TABLE customers; --"),
+        ("customer_id", "synthetic-secret-value-do-not-reflect"),
+        ("ingredients", "oversized-synthetic-payload-" + "x" * 12000),
+        ("customer_id", "not-a-uuid"),
+    ],
+)
+async def test_safe_tool_masks_validation_values_and_internals(
+    field, payload, customer_id, embedding
+):
+    """Validation errors reveal neither hostile values nor Pydantic diagnostics."""
+    from app.schemas import RecipeSaveInput
+
+    values = {
+        "customer_id": customer_id,
+        "recipe_name": "Berry blend",
+        "day_number": 1,
+        "ingredients": "berries",
+        "instructions": "Blend.",
+        "embedding": embedding,
+    }
+    values[field] = payload
+
+    async def invalid_tool():
+        """Trigger real Pydantic validation inside the wrapped tool."""
+        RecipeSaveInput(**values)
+
+    with pytest.raises(ToolError) as error:
+        await _safe_tool(invalid_tool)()
+
+    rendered = str(error.value)
+    assert rendered.startswith("code=invalid_input; message=The tool input is invalid.;")
+    assert rendered.endswith("retryable=false")
+    assert payload not in rendered
+    assert "ValidationError" not in rendered
+    assert "input_value" not in rendered
+    assert "Traceback" not in rendered
+
+
+@pytest.mark.asyncio
+async def test_safe_tool_masks_unexpected_details_and_logs_only_reference_and_type():
+    """Unexpected error messages and payloads stay out of responses and logs."""
+    import io
+
+    output = io.StringIO()
+    sink_id = logger.add(output, format="{message}")
+    secret = "synthetic-db-password-and-SQL-SELECT-secret"
+
+    async def unexpected_failure(payload):
+        """Raise an unexpected failure containing synthetic sensitive details."""
+        raise RuntimeError(f"{secret}; request={payload}")
+
+    try:
+        with pytest.raises(ToolError) as error:
+            await _safe_tool(unexpected_failure)(secret)
+    finally:
+        logger.remove(sink_id)
+
+    rendered = str(error.value)
+    logged = output.getvalue()
+    assert rendered.startswith("Request failed; reference=")
+    reference = rendered.split("reference=", 1)[1]
+    assert reference and len(reference) == 32
+    assert reference in logged
+    assert "RuntimeError" in logged
+    assert secret not in rendered
+    assert secret not in logged
+    assert "request=" not in logged
+    assert "Traceback" not in rendered
+
+
+@pytest.mark.asyncio
+async def test_safe_tool_translates_invalid_input_error_without_retry():
+    """The explicit invalid-input category is rendered as non-retryable."""
+    async def invalid_request():
+        """Raise an expected safe invalid-input service error."""
+        raise InvalidInputError("attacker-controlled detail")
+
+    with pytest.raises(ToolError) as error:
+        await _safe_tool(invalid_request)()
+
+    assert "code=invalid_input;" in str(error.value)
+    assert "retryable=false" in str(error.value)
+    assert "attacker-controlled detail" not in str(error.value)
 
 
 @pytest.mark.asyncio
@@ -85,3 +207,24 @@ async def test_safe_tool_masks_unexpected_exception_details():
 
     assert "reference=" in str(error.value)
     assert "synthetic internal database detail" not in str(error.value)
+
+
+def test_readme_documents_the_safe_structured_error_contract():
+    """The README contract remains aligned with rendered errors regardless of wrapping."""
+    import re
+    from pathlib import Path
+
+    readme = Path(__file__).resolve().parents[1] / "README.md"
+    text = " ".join(readme.read_text(encoding="utf-8").split())
+
+    for phrase in (
+        "code=<code>; message=<message>; hint=<hint>; retryable=<true|false>",
+        "not_found",
+        "conflict",
+        "database_unavailable",
+        "invalid_input",
+        "reference ID",
+        "bounded retry policy",
+        "same code and client-visible text",
+    ):
+        assert re.search(re.escape(phrase), text, flags=re.IGNORECASE), phrase

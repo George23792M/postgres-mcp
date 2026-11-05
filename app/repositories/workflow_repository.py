@@ -2,7 +2,7 @@
 
 import asyncpg
 
-from app.errors import ConflictError, NotFoundError
+from app.errors import NotFoundError, map_database_error
 from app.schemas import (
     ClaimWorkflowInput,
     WorkflowClaim,
@@ -45,19 +45,25 @@ async def claim_pending_workflow(
     request: ClaimWorkflowInput,
 ) -> WorkflowClaim | None:
     """Claim the oldest pending workflow without blocking other workers."""
-    async with pool.acquire() as connection:
-        async with connection.transaction():
-            row = await connection.fetchrow(
-                CLAIM_PENDING_SQL,
-                request.workflow_type.value,
-            )
-            if row is None:
-                return None
-            claimed = await connection.fetchrow(
-                SET_WORKFLOW_RUNNING_SQL,
-                row["id"],
-                request.worker_id,
-            )
+    try:
+        async with pool.acquire() as connection:
+            async with connection.transaction():
+                row = await connection.fetchrow(
+                    CLAIM_PENDING_SQL,
+                    request.workflow_type.value,
+                )
+                if row is None:
+                    return None
+                claimed = await connection.fetchrow(
+                    SET_WORKFLOW_RUNNING_SQL,
+                    row["id"],
+                    request.worker_id,
+                )
+    except asyncpg.PostgresError as error:
+        mapped_error = map_database_error(error)
+        if mapped_error is not None:
+            raise mapped_error from error
+        raise
     return WorkflowClaim.model_validate(dict(claimed))
 
 
@@ -77,8 +83,11 @@ async def update_workflow_status(
                 request.validation_errors,
                 request.email_status.value if request.email_status else None,
             )
-    except asyncpg.UniqueViolationError as error:
-        raise ConflictError("Workflow status conflicts with an active run") from error
+    except asyncpg.PostgresError as error:
+        mapped_error = map_database_error(error)
+        if mapped_error is not None:
+            raise mapped_error from error
+        raise
     if row is None:
         raise NotFoundError("Workflow not found or not owned by this worker")
     return WorkflowUpdateResult.model_validate(dict(row))

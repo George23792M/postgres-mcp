@@ -4,7 +4,7 @@ from uuid import UUID
 
 import asyncpg
 
-from app.errors import NotFoundError
+from app.errors import NotFoundError, map_database_error
 from app.schemas import CustomerProfile, DietaryConstraints
 
 CUSTOMER_PROFILE_SQL = """
@@ -25,7 +25,13 @@ async def fetch_customer_profile(
     customer_id: UUID,
 ) -> CustomerProfile:
     """Fetch an active customer and only their active preferences."""
-    rows = await pool.fetch(CUSTOMER_PROFILE_SQL, customer_id)
+    try:
+        rows = await pool.fetch(CUSTOMER_PROFILE_SQL, customer_id)
+    except asyncpg.PostgresError as error:
+        mapped_error = map_database_error(error)
+        if mapped_error is not None:
+            raise mapped_error from error
+        raise
     if not rows:
         raise NotFoundError("Customer not found or inactive")
     preferences = [_build_preference(row) for row in rows if row["preference_id"]]

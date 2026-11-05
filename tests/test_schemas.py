@@ -133,7 +133,7 @@ def test_workflow_inputs_reject_invalid_enum_ids_and_worker_bounds():
 
 @pytest.mark.parametrize(
     "reason",
-    ["Traceback starts here", "traceback starts here", "first\nsecond", "first\rsecond"],
+    ["Traceback starts here", "traceback starts here", "TRACEBACK starts here", "TrAcEbAcK starts here", "first\nsecond", "first\rsecond"],
 )
 def test_workflow_update_rejects_multiline_diagnostics(reason):
     """Failure details cannot contain tracebacks or multiple lines."""

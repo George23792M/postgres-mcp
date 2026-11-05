@@ -20,7 +20,7 @@ from starlette.types import ASGIApp, Receive, Scope, Send
 
 from app.config import Settings, get_settings
 from app.db import close_pool, create_pool
-from app.errors import ToolServiceError
+from app.errors import InvalidInputError, ToolServiceError
 from app.tools.customer_tools import get_customer_profile
 from app.tools.recipe_tools import check_duplicate_recipe, save_recipe
 from app.tools.workflow_tools import claim_pending_workflow, update_workflow_status
@@ -81,6 +81,14 @@ async def lifespan(
         await close_pool()
 
 
+def _format_service_error(error: ToolServiceError) -> str:
+    """Render stable safe metadata for expected MCP tool failures."""
+    return (
+        f"code={error.code}; message={error.safe_message}; "
+        f"hint={error.hint}; retryable={str(error.retryable).lower()}"
+    )
+
+
 def _safe_tool(tool: ToolFunction) -> ToolFunction:
     """Translate expected failures and mask unexpected tool exceptions."""
 
@@ -90,9 +98,10 @@ def _safe_tool(tool: ToolFunction) -> ToolFunction:
         try:
             return await tool(*args, **kwargs)
         except ToolServiceError as error:
-            raise ToolError(str(error)) from error
+            raise ToolError(_format_service_error(error)) from error
         except ValidationError as error:
-            raise ToolError("Invalid tool input") from error
+            invalid_input = InvalidInputError()
+            raise ToolError(_format_service_error(invalid_input)) from error
         except Exception as error:
             reference = uuid4().hex
             logger.error(

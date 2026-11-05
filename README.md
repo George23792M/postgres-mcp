@@ -102,6 +102,28 @@ client-safe tool errors. Unexpected failures return a generic message with a
 reference ID; logs contain the reference and error type, not recipe text,
 embeddings, credentials, or database connection strings.
 
+### Error contract
+
+Expected tool errors use the stable format
+`code=<code>; message=<message>; hint=<hint>; retryable=<true|false>`. Clients
+should branch on `code` and follow the safe `hint`; the other fields are for
+readable guidance and retry handling:
+
+- `not_found`: the requested resource was not found. A missing workflow and a
+  workflow not owned by the requesting worker intentionally have the same code
+  and client-visible text.
+- `conflict`: the requested change conflicts with the current resource state.
+- `database_unavailable`: the service cannot currently access its database;
+  this is the only expected category marked retryable.
+- `invalid_input`: the request did not satisfy an input constraint. The
+  response is generic and does not echo supplied values or validation internals.
+
+Only retry when `retryable=true`, and use a bounded retry policy with delays;
+do not retry indefinitely. Validation, not-found, and conflict errors are not
+retryable. Unexpected failures are masked and include only a reference ID for
+support; logs associate that reference with the exception type without request
+or database details.
+
 | Tool | Inputs | Result |
 | --- | --- | --- |
 | `get_customer_profile` | `customer_id` | Active customer identity and active dietary preferences. An unknown or inactive customer is not found; no active preferences returns empty lists. |

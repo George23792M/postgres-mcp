@@ -2,10 +2,11 @@
 
 from uuid import UUID
 
+import asyncpg
 import pytest
 from pydantic import ValidationError
 
-from app.errors import NotFoundError
+from app.errors import ConflictError, DatabaseUnavailableError, NotFoundError
 from app.repositories.customer_repository import (
     CUSTOMER_PROFILE_SQL,
     fetch_customer_profile,
@@ -16,14 +17,17 @@ from app.schemas import CustomerProfileInput
 class FakeCustomerPool:
     """Record customer queries and return prearranged database rows."""
 
-    def __init__(self, rows):
-        """Store the rows returned by the fake pool."""
+    def __init__(self, rows, error=None):
+        """Store the rows or exception returned by the fake pool."""
         self.rows = rows
+        self.error = error
         self.calls = []
 
     async def fetch(self, query, *args):
         """Record a parameterized query and return the configured rows."""
         self.calls.append((query, args))
+        if self.error is not None:
+            raise self.error
         return self.rows
 
 
@@ -96,3 +100,40 @@ def test_profile_input_rejects_sql_injection_instead_of_accepting_text():
     """Customer IDs are UUIDs, so SQL fragments are not accepted as identifiers."""
     with pytest.raises(ValidationError):
         CustomerProfileInput(customer_id="'; DROP TABLE customers; --")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("database_error", "expected_code"),
+    [
+        (asyncpg.ForeignKeyViolationError("SENSITIVE constraint and SQL"), "not_found"),
+        (asyncpg.UniqueViolationError("SENSITIVE constraint and SQL"), "conflict"),
+        (asyncpg.ConnectionFailureError("SENSITIVE connection detail"), "database_unavailable"),
+    ],
+)
+async def test_profile_maps_known_database_failures_without_detail_leaks(
+    customer_id, database_error, expected_code
+):
+    """Recognized customer-query errors become safe structured failures with causes."""
+    pool = FakeCustomerPool([], error=database_error)
+
+    with pytest.raises((NotFoundError, ConflictError, DatabaseUnavailableError)) as error:
+        await fetch_customer_profile(pool, customer_id)
+
+    assert error.value.code == expected_code
+    assert error.value.__cause__ is database_error
+    assert "SENSITIVE" not in error.value.safe_message
+    assert "SENSITIVE" not in error.value.hint
+    assert pool.calls == [(CUSTOMER_PROFILE_SQL, (customer_id,))]
+
+
+@pytest.mark.asyncio
+async def test_profile_propagates_unknown_sqlstate_unchanged(customer_id, unknown_database_error):
+    """An unrecognized SQLSTATE remains the original exception at the customer boundary."""
+    pool = FakeCustomerPool([], error=unknown_database_error)
+
+    with pytest.raises(type(unknown_database_error)) as error:
+        await fetch_customer_profile(pool, customer_id)
+
+    assert error.value is unknown_database_error
+    assert "synthetic sensitive database diagnostic" in str(error.value)

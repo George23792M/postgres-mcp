@@ -6,7 +6,7 @@ from uuid import UUID
 import asyncpg
 import pytest
 
-from app.errors import ConflictError, NotFoundError
+from app.errors import ConflictError, DatabaseUnavailableError, NotFoundError, ToolServiceError
 from app.repositories.workflow_repository import (
     CLAIM_PENDING_SQL,
     SET_WORKFLOW_RUNNING_SQL,
@@ -36,6 +36,23 @@ def workflow_row(workflow_id, customer_id, **overrides):
         "claimed_by": "worker-a",
     }
     return row | overrides
+
+
+async def _run_workflow_operation(operation, connection, workflow_id):
+    """Run the selected workflow repository operation against a fake connection."""
+    pool = FakeWorkflowPool(connection)
+    if operation.startswith("claim"):
+        request = ClaimWorkflowInput(
+            workflow_type=WorkflowType.NEW_REGISTRATION,
+            worker_id="worker-a",
+        )
+        return await claim_pending_workflow(pool, request)
+    request = WorkflowStatusUpdate(
+        workflow_id=workflow_id,
+        worker_id="worker-a",
+        status=WorkflowStatus.PENDING,
+    )
+    return await update_workflow_status(pool, request)
 
 
 class FakeTransaction:
@@ -195,3 +212,83 @@ async def test_update_maps_unique_index_violation_to_conflict(workflow_id):
 
     with pytest.raises(ConflictError, match="conflicts with an active run"):
         await update_workflow_status(FakeWorkflowPool(connection), request)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("operation", "database_error", "expected_code"),
+    [
+        ("claim_select", asyncpg.ForeignKeyViolationError("SENSITIVE SQL detail"), "not_found"),
+        ("claim_update", asyncpg.ConnectionFailureError("SENSITIVE connection detail"), "database_unavailable"),
+        ("status_update", asyncpg.UniqueViolationError("SENSITIVE constraint detail"), "conflict"),
+    ],
+)
+async def test_workflow_database_failures_map_without_diagnostic_leaks(
+    customer_id, workflow_id, operation, database_error, expected_code
+):
+    """Workflow query failures map to safe errors while retaining the hidden cause."""
+    selected = workflow_row(workflow_id, customer_id, status="PENDING")
+    results = (
+        [database_error]
+        if operation == "claim_select"
+        else [selected, database_error]
+    )
+    if operation == "status_update":
+        results = [database_error]
+    connection = FakeConnection(results)
+
+    with pytest.raises(ToolServiceError) as error:
+        await _run_workflow_operation(operation, connection, workflow_id)
+
+    assert error.value.code == expected_code
+    assert error.value.__cause__ is database_error
+    assert "SENSITIVE" not in error.value.safe_message
+    assert "SENSITIVE" not in error.value.hint
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["claim_select", "claim_update", "status_update"])
+async def test_workflow_repository_propagates_unknown_sqlstate(
+    customer_id, workflow_id, operation, unknown_database_error
+):
+    """All workflow SQL boundaries propagate an unrecognized error unchanged."""
+    selected = workflow_row(workflow_id, customer_id, status="PENDING")
+    results = (
+        [unknown_database_error]
+        if operation == "claim_select"
+        else [selected, unknown_database_error]
+    )
+    if operation == "status_update":
+        results = [unknown_database_error]
+    connection = FakeConnection(results)
+
+    with pytest.raises(type(unknown_database_error)) as error:
+        await _run_workflow_operation(operation, connection, workflow_id)
+
+    assert error.value is unknown_database_error
+
+
+@pytest.mark.asyncio
+async def test_missing_and_unowned_workflows_have_identical_not_found_metadata(workflow_id):
+    """A missing row and an ownership-predicate miss reveal identical safe metadata."""
+    errors = []
+    for worker_id in ("worker-a", "synthetic-other-worker"):
+        connection = FakeConnection([None])
+        request = WorkflowStatusUpdate(
+            workflow_id=workflow_id,
+            worker_id=worker_id,
+            status=WorkflowStatus.SUCCESS,
+        )
+        with pytest.raises(NotFoundError) as error:
+            await update_workflow_status(FakeWorkflowPool(connection), request)
+        errors.append(error.value)
+
+    missing, unowned = errors
+    assert (missing.code, missing.safe_message, missing.hint, missing.retryable) == (
+        unowned.code,
+        unowned.safe_message,
+        unowned.hint,
+        unowned.retryable,
+    )
+    assert "synthetic-other-worker" not in unowned.safe_message
+    assert "synthetic-other-worker" not in unowned.hint

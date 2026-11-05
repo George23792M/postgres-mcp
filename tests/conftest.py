@@ -4,6 +4,7 @@ import sys
 from pathlib import Path
 from uuid import UUID
 
+import asyncpg
 import pytest
 
 # The source tree is not installed as a package; make the repository importable
@@ -43,3 +44,23 @@ def workflow_id() -> UUID:
 def embedding() -> list[float]:
     """Return a finite, correctly dimensioned synthetic vector."""
     return [0.0] * 1536
+
+
+class SyntheticPostgresError(asyncpg.PostgresError):
+    """Provide an unknown SQLSTATE for repository propagation tests."""
+
+    def __init__(self, sqlstate="99999", message="synthetic sensitive database diagnostic"):
+        """Initialize an asyncpg-shaped exception without a database connection."""
+        super().__init__(message)
+        self._test_sqlstate = sqlstate
+
+    @property
+    def sqlstate(self):
+        """Return the configured synthetic SQLSTATE."""
+        return self._test_sqlstate
+
+
+@pytest.fixture
+def unknown_database_error():
+    """Return a fresh unrecognized asyncpg error for propagation checks."""
+    return SyntheticPostgresError()

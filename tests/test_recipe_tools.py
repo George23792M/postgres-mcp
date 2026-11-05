@@ -5,7 +5,7 @@ from uuid import UUID
 import asyncpg
 import pytest
 
-from app.errors import NotFoundError
+from app.errors import ConflictError, DatabaseUnavailableError, NotFoundError
 from app.repositories.recipe_repository import (
     CUSTOMER_EXISTS_SQL,
     SAVE_RECIPE_SQL,
@@ -19,12 +19,17 @@ from app.schemas import RecipeDuplicateInput, RecipeSaveInput
 class FakeRecipePool:
     """Record recipe SQL calls and return predetermined database values."""
 
-    def __init__(self, *, exists=True, matches=None, saved_id=None, save_error=None):
-        """Configure fake customer existence, matches, and save outcome."""
+    def __init__(
+        self, *, exists=True, matches=None, saved_id=None, database_errors=None
+    ):
+        """Configure fake results and optional errors keyed by query operation."""
+        database_errors = database_errors or {}
         self.exists = exists
         self.matches = matches or []
         self.saved_id = saved_id
-        self.save_error = save_error
+        self.save_error = database_errors.get("save")
+        self.exists_error = database_errors.get("exists")
+        self.search_error = database_errors.get("search")
         self.calls = []
         self.fetchval_calls = 0
 
@@ -33,6 +38,8 @@ class FakeRecipePool:
         self.calls.append((query, args))
         self.fetchval_calls += 1
         if query == CUSTOMER_EXISTS_SQL:
+            if self.exists_error is not None:
+                raise self.exists_error
             return self.exists
         if self.save_error is not None:
             raise self.save_error
@@ -41,6 +48,8 @@ class FakeRecipePool:
     async def fetch(self, query, *args):
         """Record a query and return the configured recipe matches."""
         self.calls.append((query, args))
+        if self.search_error is not None:
+            raise self.search_error
         return self.matches
 
 
@@ -137,7 +146,59 @@ async def test_recipe_save_binds_text_and_returns_upsert_identifier(customer_id,
 @pytest.mark.asyncio
 async def test_recipe_save_maps_foreign_key_failure_to_not_found(customer_id, embedding):
     """A missing customer reported by the foreign key is returned as not found."""
-    pool = FakeRecipePool(save_error=asyncpg.ForeignKeyViolationError("synthetic constraint"))
+    pool = FakeRecipePool(
+        database_errors={"save": asyncpg.ForeignKeyViolationError("synthetic constraint")}
+    )
 
     with pytest.raises(NotFoundError, match="Customer not found"):
         await insert_recipe(pool, make_recipe_input(customer_id, embedding))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("operation", "database_error", "expected_code"),
+    [
+        ("exists", asyncpg.ForeignKeyViolationError("SENSITIVE SQL detail"), "not_found"),
+        ("search", asyncpg.ConnectionFailureError("SENSITIVE connection detail"), "database_unavailable"),
+        ("save", asyncpg.UniqueViolationError("SENSITIVE constraint detail"), "conflict"),
+    ],
+)
+async def test_recipe_database_failures_map_to_safe_categories(
+    customer_id, embedding, operation, database_error, expected_code
+):
+    """Recipe reads and writes map known SQLSTATEs and preserve safe metadata."""
+    from app.errors import ToolServiceError
+
+    pool = FakeRecipePool(database_errors={operation: database_error})
+
+    with pytest.raises(ToolServiceError) as error:
+        if operation in ("exists", "search"):
+            await find_similar_recipes(
+                pool, RecipeDuplicateInput(customer_id=customer_id, embedding=embedding)
+            )
+        else:
+            await insert_recipe(pool, make_recipe_input(customer_id, embedding))
+
+    assert error.value.code == expected_code
+    assert error.value.__cause__ is database_error
+    assert "SENSITIVE" not in error.value.safe_message
+    assert "SENSITIVE" not in error.value.hint
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["exists", "search", "save"])
+async def test_recipe_repository_propagates_unknown_sqlstate(
+    customer_id, embedding, operation, unknown_database_error
+):
+    """Every recipe query boundary propagates unknown asyncpg SQLSTATEs unchanged."""
+    pool = FakeRecipePool(database_errors={operation: unknown_database_error})
+
+    with pytest.raises(type(unknown_database_error)) as error:
+        if operation in ("exists", "search"):
+            await find_similar_recipes(
+                pool, RecipeDuplicateInput(customer_id=customer_id, embedding=embedding)
+            )
+        else:
+            await insert_recipe(pool, make_recipe_input(customer_id, embedding))
+
+    assert error.value is unknown_database_error
