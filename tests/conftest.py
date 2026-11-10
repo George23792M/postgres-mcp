@@ -36,6 +36,7 @@ def test_settings() -> Settings:
 def initialize_retry_config(test_settings):
     """Initialize retry configuration before each test using test settings."""
     from app.retry import RetryConfig, set_retry_config
+
     retry_config = RetryConfig.from_settings(test_settings)
     set_retry_config(retry_config)
 
@@ -61,7 +62,9 @@ def embedding() -> list[float]:
 class SyntheticPostgresError(asyncpg.PostgresError):
     """Provide an unknown SQLSTATE for repository propagation tests."""
 
-    def __init__(self, sqlstate="99999", message="synthetic sensitive database diagnostic"):
+    def __init__(
+        self, sqlstate="99999", message="synthetic sensitive database diagnostic"
+    ):
         """Initialize an asyncpg-shaped exception without a database connection."""
         super().__init__(message)
         self._test_sqlstate = sqlstate
