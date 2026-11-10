@@ -33,12 +33,19 @@ class Settings(BaseSettings):
     db_pool_min_size: int = Field(default=1, ge=1, le=100)
     db_pool_max_size: int = Field(default=10, ge=1, le=100)
     db_command_timeout: float = Field(default=30.0, gt=0, le=300)
+    # Retry configuration
+    retry_max_attempts: int = Field(default=3, ge=1, le=10)
+    retry_initial_wait_seconds: float = Field(default=0.5, gt=0, le=60.0)
+    retry_max_wait_seconds: float = Field(default=10.0, gt=0, le=300.0)
+    retry_multiplier: float = Field(default=2.0, ge=1.0, le=10.0)
 
     @model_validator(mode="after")
     def validate_pool_sizes(self) -> "Settings":
         """Ensure the configured pool maximum is not below its minimum."""
         if self.db_pool_max_size < self.db_pool_min_size:
             raise ValueError("DB_POOL_MAX_SIZE must be at least DB_POOL_MIN_SIZE")
+        if self.retry_max_wait_seconds < self.retry_initial_wait_seconds:
+            raise ValueError("RETRY_MAX_WAIT_SECONDS must be >= RETRY_INITIAL_WAIT_SECONDS")
         return self
 
 

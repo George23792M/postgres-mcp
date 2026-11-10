@@ -174,6 +174,7 @@ async def test_update_rejects_a_worker_that_does_not_own_the_row(workflow_id):
 
     assert connection.calls[0][1][:2] == (workflow_id, "intruder")
     assert "WHERE id = $1 AND claimed_by = $2" in UPDATE_WORKFLOW_SQL
+    assert "AND status = 'RUNNING'" in UPDATE_WORKFLOW_SQL
 
 
 @pytest.mark.asyncio

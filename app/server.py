@@ -1,4 +1,4 @@
-"""Authenticated FastMCP server construction and lifespan management."""
+﻿"""Authenticated FastMCP server construction and lifespan management."""
 
 import hmac
 import sys
@@ -21,8 +21,16 @@ from starlette.types import ASGIApp, Receive, Scope, Send
 from app.config import Settings, get_settings
 from app.db import close_pool, create_pool
 from app.errors import InvalidInputError, ToolServiceError
+from app.retry import RetryConfig, set_retry_config
 from app.tools.customer_tools import get_customer_profile
+from app.tools.email_tools import get_active_email_template
 from app.tools.recipe_tools import check_duplicate_recipe, save_recipe
+from app.tools.subscription_tools import (
+    check_database_ready, claim_registration_workflow, complete_registration_workflow,
+    complete_subscription_batch,
+    create_subscription_batch, get_subscription_batch_history,
+    get_subscription_claim_status, get_subscription_customer, get_subscription_workflow_history,
+)
 from app.tools.workflow_tools import claim_pending_workflow, update_workflow_status
 
 ToolFunction = Callable[..., Awaitable[Any]]
@@ -73,8 +81,11 @@ async def lifespan(
     server: FastMCP,
     settings: Settings | None = None,
 ) -> AsyncIterator[dict[str, object]]:
-    """Create the database pool on startup and close it during shutdown."""
-    await create_pool(settings)
+    """Initialize retry config and database pool at startup."""
+    config = settings or get_settings()
+    retry_config = RetryConfig.from_settings(config)
+    set_retry_config(retry_config)
+    await create_pool(config)
     try:
         yield {}
     finally:
@@ -128,9 +139,18 @@ class AuthenticatedFastMCP(FastMCP):
         app.add_middleware(BearerAuthMiddleware, token=self._bearer_token)
         return app
 
+    async def call_tool(self, name: str, arguments: dict[str, Any]) -> Any:
+        """Mask FastMCP argument-validation errors before they reach clients."""
+        try:
+            return await super().call_tool(name, arguments)
+        except ToolError as error:
+            if isinstance(error.__cause__, ValidationError):
+                raise ToolError(_format_service_error(InvalidInputError())) from None
+            raise
+
 
 def create_server(settings: Settings | None = None) -> AuthenticatedFastMCP:
-    """Create the configured server and register exactly five tools."""
+    """Create the configured server and register its database tools."""
     config = settings or get_settings()
     logger.remove()
     logger.add(sys.stderr, level=config.log_level)
@@ -154,7 +174,7 @@ def create_server(settings: Settings | None = None) -> AuthenticatedFastMCP:
 
 
 def _register_tools(server: FastMCP) -> None:
-    """Register the five database tools with concise agent-facing descriptions."""
+    """Register database tools with concise agent-facing descriptions."""
     tools = (
         (
             get_customer_profile,
@@ -170,6 +190,19 @@ def _register_tools(server: FastMCP) -> None:
         ),
         (check_duplicate_recipe, "Find similar recipes in this customer's history."),
         (save_recipe, "Idempotently save a recipe and its caller-provided embedding."),
+        (get_subscription_customer, "Get an active customer and latest active subscription."),
+        (claim_registration_workflow, "Claim a registration workflow idempotently."),
+        (get_subscription_claim_status, "Look up a claim request for manual reconciliation."),
+        (complete_registration_workflow, "Complete an owned registration workflow."),
+        (get_subscription_workflow_history, "List a customer's workflow history."),
+        (create_subscription_batch, "Create a registration batch."),
+        (complete_subscription_batch, "Complete a registration batch."),
+        (get_subscription_batch_history, "List registration batch history."),
+        (check_database_ready, "Check PostgreSQL readiness."),
+        (get_active_email_template, "Get the active email template for a given name."),
     )
     for tool, description in tools:
         server.tool(description=description)(_safe_tool(tool))
+
+
+

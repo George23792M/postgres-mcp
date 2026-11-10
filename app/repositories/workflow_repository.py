@@ -35,7 +35,7 @@ UPDATE_WORKFLOW_SQL = """
         completed_at = CASE WHEN $3 IN ('SUCCESS', 'FAILED')
                             THEN CURRENT_TIMESTAMP ELSE NULL END,
         updt_ts = CURRENT_TIMESTAMP
-    WHERE id = $1 AND claimed_by = $2
+    WHERE id = $1 AND claimed_by = $2 AND status = 'RUNNING'
     RETURNING id, status, attempt_count, email_status
 """
 

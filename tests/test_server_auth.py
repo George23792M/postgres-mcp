@@ -46,8 +46,8 @@ def test_bearer_auth_compares_scheme_case_insensitively_and_bounds_header(test_s
 
 
 @pytest.mark.asyncio
-async def test_server_registers_exactly_five_expected_tools(test_settings):
-    """The MCP server exposes all five named tools and their input schemas."""
+async def test_server_registers_expected_tools(test_settings):
+    """The MCP server exposes its named tools and their input schemas."""
     server = create_server(test_settings)
 
     tools = await server.list_tools()
@@ -58,6 +58,15 @@ async def test_server_registers_exactly_five_expected_tools(test_settings):
         "update_workflow_status",
         "check_duplicate_recipe",
         "save_recipe",
+        "get_subscription_customer",
+        "claim_registration_workflow",
+        "get_subscription_claim_status",
+        "complete_registration_workflow",
+        "get_subscription_workflow_history",
+        "create_subscription_batch",
+        "complete_subscription_batch",
+        "get_subscription_batch_history",
+        "check_database_ready",
     }
     assert all(tool.inputSchema.get("type") == "object" for tool in tools)
     assert {tool.name: tool.description for tool in tools}["save_recipe"]
@@ -193,6 +202,21 @@ async def test_safe_tool_translates_invalid_input_error_without_retry():
     assert "code=invalid_input;" in str(error.value)
     assert "retryable=false" in str(error.value)
     assert "attacker-controlled detail" not in str(error.value)
+
+
+@pytest.mark.asyncio
+async def test_call_tool_masks_pre_execution_validation_errors(test_settings, monkeypatch):
+    """FastMCP validation must not expose the supplied argument in errors."""
+    server = create_server(test_settings)
+    monkeypatch.setattr(server, "get_context", lambda: None)
+    invalid_id = "synthetic-invalid-uuid-payload"
+
+    with pytest.raises(ToolError) as error:
+        await server.call_tool("get_customer_profile", {"customer_id": invalid_id})
+
+    assert str(error.value).startswith("code=invalid_input;")
+    assert "retryable=false" in str(error.value)
+    assert invalid_id not in str(error.value)
 
 
 @pytest.mark.asyncio

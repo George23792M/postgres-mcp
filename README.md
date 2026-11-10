@@ -12,12 +12,24 @@ Python MCP SDK's FastMCP implementation with the streamable HTTP transport.
 - Migration 002 from this repository's `qeuries.sql`, applied after the base
   schema. The migration adds the active-preference, workflow-claim, and
   per-customer/day uniqueness columns and indexes used by the tools.
+- Migration `migrations/003_subscription_workflows.sql`, applied after 002,
+  adds subscription batch tracking and replay-safe claim request records.
+  Review existing tables, indexes, data and permissions before applying it;
+  back up the database and test migration and rollback in a staging environment.
+  Rollback requires stopping subscription workers and removing the two new
+  tables only after preserving any batch and reconciliation records needed for
+  audit. The migration is not automatically applied.
 
 The server does not create extensions or run migrations. Apply schema changes
 with a database administrator before starting the server. Use a dedicated
 database role for this service: grant only the needed `SELECT` access on
-`customers` and `customer_preferences`, `SELECT`/`UPDATE` on `workflow_runs`,
-and `SELECT`/`INSERT`/`UPDATE` on `recipe_history`. Do not grant DDL, delete, or
+`customers`, `customer_preferences`, and `subscriptions`;
+`SELECT`/`INSERT`/`UPDATE` on `workflow_runs`, `recipe_history`, `batch_runs`,
+and `subscription_claim_requests`. PostgreSQL `SELECT ... FOR UPDATE` also
+requires an appropriate `UPDATE` privilege on the locked customer rows; grant
+only the minimum column-level update privilege your PostgreSQL deployment
+requires, and restrict it using role and row-level policies where appropriate.
+Do not grant DDL, delete, or
 access to unrelated tables. Use row-level security or a trusted gateway if the
 service must restrict access to particular customers; the shared MCP bearer
 token does not identify individual agents.
@@ -128,7 +140,15 @@ or database details.
 | --- | --- | --- |
 | `get_customer_profile` | `customer_id` | Active customer identity and active dietary preferences. An unknown or inactive customer is not found; no active preferences returns empty lists. |
 | `claim_pending_workflow` | `workflow_type` (`NEW_REGISTRATION` or `RECIPE_GENERATION`), `worker_id` (1–100 chars) | Oldest pending workflow claimed atomically as `RUNNING`, or `null` when the queue is empty. Concurrent workers skip rows already being claimed. |
-| `update_workflow_status` | `workflow_id`, `worker_id`, `status` (`PENDING`, `RUNNING`, `SUCCESS`, `FAILED`), optional `increment_attempt`, single-line `validation_errors` (max 500 chars), optional `email_status` (`PENDING`, `SENT`, `FAILED`) | Updated status, attempt count (capped at 3), and email status. Only the worker recorded in `claimed_by` can update the row. `completed_at` is set for `SUCCESS`/`FAILED` and cleared otherwise. |
+| `update_workflow_status` | `workflow_id`, `worker_id`, `status` (`PENDING`, `RUNNING`, `SUCCESS`, `FAILED`), optional `increment_attempt`, single-line `validation_errors` (max 500 chars), optional `email_status` (`PENDING`, `SENT`, `FAILED`) | Updated status, attempt count (capped at 3), and email status. Only the worker recorded in `claimed_by` can update a `RUNNING` row; terminal rows cannot be overwritten. `completed_at` is set for `SUCCESS`/`FAILED` and cleared otherwise. |
+| `get_subscription_customer` | `customer_id` | Active customer and newest active subscription, ordered by creation time and ID; not found when no active plan exists. |
+| `claim_registration_workflow` | `request_id`, `worker_id`, optional `customer_id` | Atomically claim a pending registration; replaying the same request ID and arguments cannot claim a second row. A targeted call creates a pending row only if no prior registration run exists. |
+| `get_subscription_claim_status` | `request_id` | Request ID, worker ID, completion flag, workflow ID and current workflow/email statuses, without customer details. Missing requests return `not_found`. |
+| `complete_registration_workflow` | `workflow_id`, `worker_id`, `result` | Complete an owned running registration; replaying an identical terminal result does not increment attempts again. |
+| `get_subscription_workflow_history` | `customer_id`, optional `workflow_type`, `limit` (1-100) | Most recent workflow history for a customer. |
+| `create_subscription_batch`, `complete_subscription_batch` | `batch_id`, and `result` for completion | Create or complete a replay-safe batch record. Completion validates outcome counts. |
+| `get_subscription_batch_history` | `limit` (1-100) | Most recent batch records. |
+| `check_database_ready` | none | Executes a database query and reports readiness. |
 | `check_duplicate_recipe` | `customer_id`, `embedding` (exactly 1536 finite numbers), optional `threshold` (exclusive 0, up to 1; default `0.90`), optional `limit` (1–20; default `5`) | `is_duplicate` and closest matching recipes (`recipe_name`, `day_number`, `similarity`), scoped to that customer. |
 | `save_recipe` | `customer_id`, `recipe_name` (1–255 chars), `day_number` (at least 1), `ingredients` (up to 12,000 chars), `instructions` (up to 20,000 chars), `embedding` (exactly 1536 finite numbers), optional `calories` (0–10,000) | Recipe UUID. Repeating a save for the same customer/day updates the existing row. |
 
@@ -169,6 +189,18 @@ await session.call_tool(
 )
 ```
 
-`claim_pending_workflow` has no stale-claim recovery; a crashed worker can
-leave a workflow in `RUNNING`. Recovery and per-agent authorization are outside
-the current server scope.
+### Reconciliation of uncertain outcomes
+
+A lost response to a mutation, including a database timeout, does not prove
+whether it committed. Do not retry with a new request ID, automatically
+reclaim a running workflow, or resend an email. Use the subscription service's
+logged claim request ID with `get_subscription_claim_status` to inspect the
+recorded worker, workflow ID, workflow status and email status. A missing
+request may still be in flight: confirm it has stopped and investigate before
+taking action. A completed request with no workflow ID means no row was claimed.
+Inspect batch history using the logged batch ID; an unfinished batch needs
+operator review and is not proof the queue was empty. For a possibly sent
+email, reconcile with the future email provider before any manual repair.
+Never infer delivery from a database status alone. Any manual database repair
+requires an authorized operator, an audit trail, and a verified delivery
+outcome; no automatic recovery or exactly-once delivery is provided.

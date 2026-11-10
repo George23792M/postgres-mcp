@@ -58,19 +58,3 @@ CREATE TABLE IF NOT EXISTS email_templates (
 CREATE UNIQUE INDEX IF NOT EXISTS idx_email_templates_active_unique 
     ON email_templates (template_name) 
     WHERE status = 'ACTIVE';
-
-
--- 5. Create manual_review table (For guardrail exceptions or workflow failures)
--- CREATE TABLE IF NOT EXISTS manual_review (
---     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
---     customer_id UUID REFERENCES customers(id) ON DELETE CASCADE,
---     correlation_id UUID,
---     reason TEXT NOT NULL,
---     details JSONB,
---     status VARCHAR(50) DEFAULT 'OPEN',
---     cre_ts TIMESTAMPTZ DEFAULT (CURRENT_TIMESTAMP AT TIME ZONE 'UTC')
--- );
-
--- Indexes for efficient lookups on review logs
--- CREATE INDEX IF NOT EXISTS idx_manual_review_status ON manual_review(status);
--- CREATE INDEX IF NOT EXISTS idx_manual_review_customer ON manual_review(customer_id);
