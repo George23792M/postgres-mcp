@@ -11,22 +11,9 @@ from tenacity import (
     wait_exponential,
 )
 
-from app.errors import DatabaseUnavailableError, map_database_error
+from app.errors import DatabaseUnavailableError, RetryExhaustedError, map_database_error
 
 Result = TypeVar("Result")
-
-
-class RetryExhaustedError(Exception):
-    """Raised when a database operation fails after all retry attempts are exhausted."""
-
-    def __init__(self, operation_name: str, max_attempts: int, last_error: Exception) -> None:
-        """Initialize with operation context and the last error encountered."""
-        self.operation_name = operation_name
-        self.max_attempts = max_attempts
-        self.last_error = last_error
-        super().__init__(
-            f"Operation '{operation_name}' failed after {max_attempts} attempts: {type(last_error).__name__}"
-        )
 
 
 class RetryConfig:
@@ -96,39 +83,53 @@ async def with_database_retry(
 
     This is the main entry point for tools: translate asyncpg errors, then apply retry logic.
     Only DatabaseUnavailableError is retried; other errors fail immediately.
+    
+    When all retries are exhausted, raises RetryExhaustedError (retryable=false)
+    instead of DatabaseUnavailableError to signal the client that further retries
+    won't help and they should try again after a longer delay.
     """
     config = get_retry_config()
     attempt_count = 0
+    last_error: DatabaseUnavailableError | None = None
 
-    async for attempt in AsyncRetrying(
-        stop=stop_after_attempt(config.max_attempts),
-        wait=wait_exponential(
-            multiplier=config.multiplier,
-            min=config.initial_wait_seconds,
-            max=config.max_wait_seconds,
-        ),
-        retry=retry_if_exception_type(DatabaseUnavailableError),
-        reraise=True,
-    ):
-        with attempt:
-            attempt_count += 1
-            try:
-                return await _translate_database_errors(operation)
-            except DatabaseUnavailableError as error:
-                if attempt_count < config.max_attempts:
-                    logger.warning(
-                        "Database unavailable (attempt {}/{}): {}",
-                        attempt_count,
-                        config.max_attempts,
-                        operation_name,
-                    )
-                else:
-                    logger.error(
-                        "Database operation failed after {} attempts: {}",
-                        config.max_attempts,
-                        operation_name,
-                    )
-                raise
+    try:
+        async for attempt in AsyncRetrying(
+            stop=stop_after_attempt(config.max_attempts),
+            wait=wait_exponential(
+                multiplier=config.multiplier,
+                min=config.initial_wait_seconds,
+                max=config.max_wait_seconds,
+            ),
+            retry=retry_if_exception_type(DatabaseUnavailableError),
+            reraise=True,
+        ):
+            with attempt:
+                attempt_count += 1
+                try:
+                    return await _translate_database_errors(operation)
+                except DatabaseUnavailableError as error:
+                    last_error = error
+                    if attempt_count < config.max_attempts:
+                        logger.warning(
+                            "Database unavailable (attempt {}/{}): {}",
+                            attempt_count,
+                            config.max_attempts,
+                            operation_name,
+                        )
+                    else:
+                        logger.error(
+                            "Database operation failed after {} attempts: {}",
+                            config.max_attempts,
+                            operation_name,
+                        )
+                    raise
+    except DatabaseUnavailableError as error:
+        # Retries exhausted: convert to RetryExhaustedError
+        raise RetryExhaustedError(
+            operation_name=operation_name,
+            max_attempts=config.max_attempts,
+            last_error=error,
+        ) from error
 
 
 async def _translate_database_errors(operation: Callable[[], Any]) -> Any:

@@ -1,6 +1,6 @@
 ﻿"""Tests for email template tool."""
 
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 from uuid import uuid4
 
 import pytest
@@ -12,8 +12,9 @@ from app.tools.email_tools import get_active_email_template
 async def test_get_active_email_template_found(monkeypatch):
     """Test successful retrieval of an active email template."""
     from app.repositories import email_repository
+    from app.tools import email_tools
     
-    mock_pool = AsyncMock()
+    mock_pool = MagicMock()
     expected_template = {
         "active": True,
         "subject": "Welcome!",
@@ -25,6 +26,8 @@ async def test_get_active_email_template_found(monkeypatch):
             return expected_template
         return None
     
+    # Mock get_pool in the email_tools module (where it's imported) and the repository function
+    monkeypatch.setattr(email_tools, "get_pool", MagicMock(return_value=mock_pool))
     monkeypatch.setattr(email_repository, "active_email_template", mock_active_template)
     
     result = await get_active_email_template("welcome")
@@ -35,10 +38,15 @@ async def test_get_active_email_template_found(monkeypatch):
 async def test_get_active_email_template_not_found(monkeypatch):
     """Test retrieval when template does not exist."""
     from app.repositories import email_repository
+    from app.tools import email_tools
+    
+    mock_pool = MagicMock()
     
     async def mock_active_template(pool, template_name):
         return None
     
+    # Mock get_pool in the email_tools module (where it's imported) and the repository function
+    monkeypatch.setattr(email_tools, "get_pool", MagicMock(return_value=mock_pool))
     monkeypatch.setattr(email_repository, "active_email_template", mock_active_template)
     
     result = await get_active_email_template("nonexistent")

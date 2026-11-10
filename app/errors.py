@@ -41,6 +41,28 @@ class DatabaseUnavailableError(ToolServiceError):
     retryable = True
 
 
+class RetryExhaustedError(ToolServiceError):
+    """Transient database error persisted after all retry attempts were exhausted."""
+
+    code = "retry_exhausted"
+    safe_message = "The database was unavailable; retries exhausted."
+    hint = "The service is experiencing persistent connectivity issues. Retry after a longer delay or contact support if the problem persists."
+    retryable = False
+
+    def __init__(
+        self,
+        operation_name: str,
+        max_attempts: int,
+        last_error: Exception | None = None,
+    ) -> None:
+        """Initialize with retry exhaustion context."""
+        self.operation_name = operation_name
+        self.max_attempts = max_attempts
+        self.last_error = last_error
+        details = f"Operation: {operation_name}, Attempts: {max_attempts}"
+        super().__init__(details)
+
+
 class InvalidInputError(ToolServiceError):
     """Represent invalid tool input without exposing validation internals."""
 

@@ -7,7 +7,7 @@ from uuid import uuid4
 import pytest
 from pydantic import ValidationError
 
-from app.errors import ConflictError, DatabaseUnavailableError, NotFoundError
+from app.errors import ConflictError, DatabaseUnavailableError, NotFoundError, RetryExhaustedError
 from app.repositories.subscription_repository import (
     CUSTOMER_SQL,
     claim_reconciliation,
@@ -16,7 +16,7 @@ from app.repositories.subscription_repository import (
     finish_registration,
 )
 from app.schemas_subscription import BatchCompletion, RegistrationCompletion
-from app.tools.subscription_tools import _database_result
+from app.retry import with_database_retry
 
 
 @pytest.mark.asyncio
@@ -51,8 +51,13 @@ async def test_database_transport_failure_is_safe(error):
         """Raise the simulated database transport failure."""
         raise error
 
-    with pytest.raises(DatabaseUnavailableError):
-        await _database_result(fail())
+    # Transport errors (TimeoutError, OSError) are first translated to DatabaseUnavailableError,
+    # then the retry loop exhausts and raises RetryExhaustedError.
+    with pytest.raises(RetryExhaustedError) as exc_info:
+        await with_database_retry(fail, "test_operation")
+    
+    # Verify the cause was a database unavailability (error translation happened)
+    assert isinstance(exc_info.value.__cause__, DatabaseUnavailableError)
 
 
 def test_subscription_customer_query_selects_latest_active_plan():
@@ -147,3 +152,7 @@ async def test_batch_completion_rejects_conflicting_replay():
 
     with pytest.raises(ConflictError):
         await complete_batch(pool, batch_id, completion)
+
+
+
+

@@ -4,10 +4,9 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from app.errors import DatabaseUnavailableError, NotFoundError
+from app.errors import DatabaseUnavailableError, NotFoundError, RetryExhaustedError
 from app.retry import (
     RetryConfig,
-    RetryExhaustedError,
     get_retry_config,
     set_retry_config,
     with_database_retry,
@@ -111,13 +110,18 @@ async def test_with_database_retry_retryable_then_success():
 
 @pytest.mark.asyncio
 async def test_with_database_retry_exhausts_attempts():
-    """Test retry exhaustion raises the last error."""
+    """Test retry exhaustion raises RetryExhaustedError instead of DatabaseUnavailableError."""
     set_retry_config(RetryConfig(max_attempts=2, initial_wait_seconds=0.01))
     operation = AsyncMock(side_effect=DatabaseUnavailableError())
 
-    with pytest.raises(DatabaseUnavailableError):
+    with pytest.raises(RetryExhaustedError) as exc_info:
         await with_database_retry(operation, "test_op")
 
+    # Verify RetryExhaustedError has correct metadata
+    error = exc_info.value
+    assert error.operation_name == "test_op"
+    assert error.max_attempts == 2
+    assert error.retryable is False
     assert operation.call_count == 2
 
 
@@ -129,5 +133,41 @@ def test_retry_exhausted_error():
     assert exc.operation_name == "test_operation"
     assert exc.max_attempts == 3
     assert exc.last_error is last_error
+    assert exc.retryable is False
+    assert exc.code == "retry_exhausted"
     assert "test_operation" in str(exc)
     assert "3" in str(exc)
+
+
+@pytest.mark.asyncio
+async def test_retry_exhausted_error_not_retryable():
+    """Test RetryExhaustedError signals retryable=false to client."""
+    set_retry_config(RetryConfig(max_attempts=3, initial_wait_seconds=0.01))
+    operation = AsyncMock(side_effect=DatabaseUnavailableError())
+
+    with pytest.raises(RetryExhaustedError) as exc_info:
+        await with_database_retry(operation, "fetch_customer")
+
+    error = exc_info.value
+    # Client-facing behavior: retryable=false tells client not to retry
+    assert error.retryable is False
+    assert error.code == "retry_exhausted"
+    assert "fetch_customer" in str(error)
+    assert "3" in str(error)
+
+
+@pytest.mark.asyncio
+async def test_database_unavailable_error_on_first_attempt():
+    """Test immediate database unavailability still raises RetryExhaustedError.
+    
+    When database is unavailable on first attempt and retries are disabled (max_attempts=1),
+    the original DatabaseUnavailableError should be converted to RetryExhaustedError.
+    """
+    set_retry_config(RetryConfig(max_attempts=1, initial_wait_seconds=0.01))
+    operation = AsyncMock(side_effect=DatabaseUnavailableError())
+
+    # Even with max_attempts=1, we raise RetryExhaustedError (not DatabaseUnavailableError)
+    with pytest.raises(RetryExhaustedError):
+        await with_database_retry(operation, "immediate_failure")
+
+    assert operation.call_count == 1

@@ -1,4 +1,4 @@
-"""Authentication, tool registration, and safe error mapping tests."""
+﻿"""Authentication, tool registration, and safe error mapping tests."""
 
 import httpx
 import pytest
@@ -67,6 +67,7 @@ async def test_server_registers_expected_tools(test_settings):
         "complete_subscription_batch",
         "get_subscription_batch_history",
         "check_database_ready",
+        "get_active_email_template",
     }
     assert all(tool.inputSchema.get("type") == "object" for tool in tools)
     assert {tool.name: tool.description for tool in tools}["save_recipe"]
@@ -252,3 +253,5 @@ def test_readme_documents_the_safe_structured_error_contract():
         "same code and client-visible text",
     ):
         assert re.search(re.escape(phrase), text, flags=re.IGNORECASE), phrase
+
+

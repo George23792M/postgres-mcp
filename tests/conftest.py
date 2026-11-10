@@ -1,4 +1,4 @@
-"""Shared deterministic fixtures for Postgres MCP unit tests."""
+﻿"""Shared deterministic fixtures for Postgres MCP unit tests."""
 
 import sys
 from pathlib import Path
@@ -25,7 +25,19 @@ def test_settings() -> Settings:
         db_port=5432,
         db_name="postgres_mcp_unit_test",
         mcp_auth_token="synthetic-token-for-unit-tests-only-0001",
+        retry_max_attempts=3,
+        retry_initial_wait_seconds=0.5,
+        retry_max_wait_seconds=10.0,
+        retry_multiplier=2.0,
     )
+
+
+@pytest.fixture(autouse=True)
+def initialize_retry_config(test_settings):
+    """Initialize retry configuration before each test using test settings."""
+    from app.retry import RetryConfig, set_retry_config
+    retry_config = RetryConfig.from_settings(test_settings)
+    set_retry_config(retry_config)
 
 
 @pytest.fixture
